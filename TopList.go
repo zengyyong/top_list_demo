@@ -101,7 +101,7 @@ func (lb *Leaderboard) UpdateScore(playerID string, score int, timestamp int64) 
 }
 
 func (lb *Leaderboard) refreshSortedList() {
-	if !lb.needRefresh && time.Since(lb.lastUpdate) < 10*time.Second {
+	if !lb.needRefresh && time.Since(lb.lastUpdate) < 2*time.Second {
 		return
 	}
 	lb.sortedList = make([]*PlayerScore, lb.heap.Len())
@@ -172,27 +172,34 @@ func (lb *Leaderboard) GetPlayerRankRange(playerID string, rangeCount int) []*Pl
 }
 
 func main() {
+	size := 1000000
+	totalSize := 2 * size
+	singleSize := size / 10
+
 	start := time.Now().UnixNano()
-	lb := NewLeaderboard(1000000)
-	for i := 0; i < 1200000; i++ {
-		lb.UpdateScore(fmt.Sprintf("player%d", i), i%500, time.Now().Unix())
+	lb := NewLeaderboard(size)
+	for i := 0; i < totalSize; i++ {
+		lb.UpdateScore(fmt.Sprintf("player%d", i), i, time.Now().Unix())
 	}
 	end := time.Now().UnixNano()
 
 	duration := (end - start) / 1e6
 	fmt.Printf("插入 1200000 数据完成，耗时 %d ms\n", duration)
 
-	time.Sleep(3 * time.Second)
+	time.Sleep(5 * time.Second)
 
-	times := 10 // 测试 10 次
+	lb.refreshSortedList()
+
+	time.Sleep(5 * time.Second)
+
+	times := 100 // 测试 100 次
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	for i := 0; i < times; i++ {
 		start := time.Now().UnixNano()
-
-		count := r.Intn(10000)
-		score := r.Intn(10000000)
+		count := r.Intn(singleSize)
+		score := r.Intn(totalSize * 2)
 		for i := 0; i < count; i++ {
-			playId := r.Intn(1500000)
+			playId := r.Intn(totalSize)
 			lb.UpdateScore(fmt.Sprintf("player%d", playId), score, time.Now().Unix())
 		}
 
@@ -205,11 +212,11 @@ func main() {
 		end := time.Now().UnixNano()
 		duration := (end - start) / 1e6
 
-		playId := r.Intn(1500000)
+		playId := r.Intn(totalSize)
 		playerRank := lb.GetPlayerRank(fmt.Sprintf("player%d", playId))
 
-		fmt.Printf("耗时 %d ms，更新条数 %d，随机玩家信息 %+v\n\n", duration, count, playerRank)
+		fmt.Printf("耗时 %d ms，更新条数 %d，随机玩家Id %d, 随机玩家信息 %+v\n\n", duration, count, playId, playerRank)
 
-		time.Sleep(2 * time.Second)
+		time.Sleep(3 * time.Second)
 	}
 }
