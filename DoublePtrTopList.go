@@ -6,7 +6,6 @@ import (
     "fmt"
     "math/rand"
     "sort"
-    "sync"
     "time"
 )
 
@@ -24,7 +23,6 @@ type RankData struct {
 }
 
 type LeaderboardServiceImpl struct {
-    mu                 sync.RWMutex
     CacheScoreRankDict map[string]RankData // 缓存更新
     ScoreRankDict      map[string]RankData // 所有玩家分数
     ScoreRankList      []RankData          // 官方排序列表 (前百万)
@@ -44,22 +42,20 @@ func NewLeaderboardService(n int) *LeaderboardServiceImpl {
 }
 
 func (s *LeaderboardServiceImpl) UpdateScore(playerID string, score int, timestamp int64) {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-
     if timestamp == 0 {
         timestamp = time.Now().UnixMilli()
     }
     data := RankData{PlayerID: playerID, Score: score, Timestamp: timestamp}
     s.CacheScoreRankDict[playerID] = data
 
-    // 若缓存达到阈值，触发刷新
-    if len(s.CacheScoreRankDict) >= s.batchThreshold {
-        s.refreshScoreRankList()
-    }
+    s.refreshScoreRankList()
 }
 
 func (s *LeaderboardServiceImpl) refreshScoreRankList() {
+    if time.Since(s.lastRefresh) < 10*time.Second {
+        return
+    }
+
     if len(s.CacheScoreRankDict) == 0 {
         return
     }
@@ -111,59 +107,54 @@ func (s *LeaderboardServiceImpl) refreshHelper(cache, official []RankData) []Ran
         cScore, oScore := cache[cIdx].Score, official[oIdx].Score
         cTs, oTs := cache[cIdx].Timestamp, official[oIdx].Timestamp
         if cScore > oScore || (cScore == oScore && cTs < oTs) {
-            gbID := cache[cIdx].PlayerID
-            if total, ok := s.ScoreRankDict[gbID]; ok && cache[cIdx].Score == total.Score {
-                rankList = append(rankList, cache[cIdx])
-            }
+            rankList = append(rankList, cache[cIdx])
             cIdx++
         } else {
-            gbID := official[oIdx].PlayerID
-            if total, ok := s.ScoreRankDict[gbID]; ok && official[oIdx].Score == total.Score {
-                rankList = append(rankList, official[oIdx])
-            }
+            rankList = append(rankList, official[oIdx])
             oIdx++
         }
     }
     // 剩余部分
     for ; oIdx < len(official); oIdx++ {
-        gbID := official[oIdx].PlayerID
-        if total, ok := s.ScoreRankDict[gbID]; ok && official[oIdx].Score == total.Score {
-            rankList = append(rankList, official[oIdx])
-        }
+        rankList = append(rankList, official[oIdx])
     }
     for ; cIdx < len(cache); cIdx++ {
-        gbID := cache[cIdx].PlayerID
-        if total, ok := s.ScoreRankDict[gbID]; ok && cache[cIdx].Score == total.Score {
-            rankList = append(rankList, cache[cIdx])
-        }
+        rankList = append(rankList, cache[cIdx])
     }
     return rankList
 }
 
 func (s *LeaderboardServiceImpl) GetPlayerRank(playerID string) RankInfo {
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-    s.checkRefresh()
+    s.refreshScoreRankList()
 
-    if data, ok := s.ScoreRankDict[playerID]; ok {
-        // 二分查找排名 (O(log N))
-        idx := sort.Search(len(s.ScoreRankList), func(i int) bool {
-            if s.ScoreRankList[i].Score == data.Score {
-                return s.ScoreRankList[i].Timestamp >= data.Timestamp
+    data, ok := s.ScoreRankDict[playerID]
+    if !ok {
+        return RankInfo{}
+    }
+
+    // 遍历已排好序的排行榜列表，找到玩家的排名
+    for i, pData := range s.ScoreRankList {
+        if pData.PlayerID == playerID {
+            return RankInfo{
+                PlayerID:  playerID,
+                Score:     data.Score,
+                Rank:      i + 1, // 索引 i + 1 就是玩家的排名
+                Timestamp: data.Timestamp,
             }
-            return s.ScoreRankList[i].Score <= data.Score
-        })
-        if idx < len(s.ScoreRankList) && s.ScoreRankList[idx].PlayerID == playerID {
-            return RankInfo{PlayerID: playerID, Score: data.Score, Rank: idx + 1, Timestamp: data.Timestamp}
         }
     }
-    return RankInfo{}
+
+    // 如果玩家不在 Top N 列表中，则返回排名为 0
+    return RankInfo{
+        PlayerID:  playerID,
+        Score:     data.Score,
+        Rank:      0,
+        Timestamp: data.Timestamp,
+    }
 }
 
 func (s *LeaderboardServiceImpl) GetTopN(n int) []RankInfo {
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-    s.checkRefresh()
+    s.refreshScoreRankList()
 
     if n > len(s.ScoreRankList) {
         n = len(s.ScoreRankList)
@@ -177,9 +168,7 @@ func (s *LeaderboardServiceImpl) GetTopN(n int) []RankInfo {
 }
 
 func (s *LeaderboardServiceImpl) GetPlayerRankRange(playerID string, rangeN int) []RankInfo {
-    s.mu.RLock()
-    defer s.mu.RUnlock()
-    s.checkRefresh()
+    s.refreshScoreRankList()
 
     data, ok := s.ScoreRankDict[playerID]
     if !ok {
@@ -208,16 +197,6 @@ func (s *LeaderboardServiceImpl) GetPlayerRankRange(playerID string, rangeN int)
     return res
 }
 
-func (s *LeaderboardServiceImpl) checkRefresh() {
-    if time.Since(s.lastRefresh) > time.Second {
-        s.mu.RUnlock()
-        s.mu.Lock()
-        s.refreshScoreRankList()
-        s.mu.Unlock()
-        s.mu.RLock()
-    }
-}
-
 func main() {
     size := 1000000
     totalSize := 2 * size
@@ -226,22 +205,25 @@ func main() {
     start := time.Now().UnixNano()
     lb := NewLeaderboardService(size)
     for i := 0; i < totalSize; i++ {
-        lb.UpdateScore(fmt.Sprintf("player%d", i), i%500, time.Now().Unix())
+        lb.UpdateScore(fmt.Sprintf("player%d", i), i, time.Now().Unix())
     }
     end := time.Now().UnixNano()
 
     duration := (end - start) / 1e6
     fmt.Printf("插入 1200000 数据完成，耗时 %d ms\n", duration)
 
+    time.Sleep(12 * time.Second)
+
+    lb.refreshScoreRankList()
+
     time.Sleep(3 * time.Second)
 
-    times := 10 // 测试 10 次
+    times := 100 // 测试 100 次
     r := rand.New(rand.NewSource(time.Now().UnixNano()))
     for i := 0; i < times; i++ {
         start := time.Now().UnixNano()
-
         count := r.Intn(singleSize)
-        score := r.Intn(size)
+        score := r.Intn(totalSize * 2)
         for i := 0; i < count; i++ {
             playId := r.Intn(totalSize)
             lb.UpdateScore(fmt.Sprintf("player%d", playId), score, time.Now().Unix())
@@ -259,7 +241,7 @@ func main() {
         playId := r.Intn(totalSize)
         playerRank := lb.GetPlayerRank(fmt.Sprintf("player%d", playId))
 
-        fmt.Printf("耗时 %d ms，更新条数 %d，随机玩家信息 %+v\n\n", duration, count, playerRank)
+        fmt.Printf("耗时 %d ms，更新条数 %d，随机玩家Id %d, 随机玩家信息 %+v\n\n", duration, count, playId, playerRank)
 
         time.Sleep(2 * time.Second)
     }
